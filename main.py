@@ -180,16 +180,36 @@ class App:
         # 注意：AppUserModelID 已在 main() 中 Tk() 创建之前设置，
         # 这样 Windows 才能正确按固定身份分组 / 固定任务栏图标。
 
+        # 任务栏/标题栏图标：两条路都设，互为兜底，杜绝回退成 TK 默认毛笔图标。
+        if os.path.exists(icon_ico):
+            try:
+                root.iconbitmap(icon_ico)  # .ico 同时影响标题栏与任务栏
+            except Exception:
+                pass
         if os.path.exists(icon_png):
             try:
                 self._icon = tk.PhotoImage(file=icon_png)
                 root.iconphoto(True, self._icon)
             except Exception:
                 pass
-        # iconbitmap(.ico) 同时影响标题栏与任务栏图标
-        if os.path.exists(icon_ico):
+
+        # 终极兜底：直接对顶层 HWND 发 WM_SETICON，绕过 TK 在某些版本下的
+        # iconbitmap/iconphoto 失效路径（这正是之前任务栏回退成 TK 毛笔的根因）。
+        if sys.platform == 'win32' and os.path.exists(icon_ico):
             try:
-                root.iconbitmap(icon_ico)
+                u = ctypes.windll.user32
+                u.LoadImageW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
+                                         ctypes.c_uint, ctypes.c_int, ctypes.c_int,
+                                         ctypes.c_uint]
+                u.LoadImageW.restype = ctypes.c_void_p
+                u.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                           ctypes.c_void_p, ctypes.c_void_p]
+                u.SendMessageW.restype = ctypes.c_void_p
+                hicon = u.LoadImageW(None, icon_ico, 1, 0, 0, 0x00000010 | 0x00002000)
+                if hicon:
+                    hwnd = root.winfo_id()
+                    u.SendMessageW(hwnd, 0x0080, 1, hicon)  # WM_SETICON ICON_BIG
+                    u.SendMessageW(hwnd, 0x0080, 0, hicon)  # WM_SETICON ICON_SMALL
             except Exception:
                 pass
 
@@ -540,13 +560,24 @@ class App:
             pass
 
     def _on_close(self):
-        """关闭窗口：先保存会话缓存，再销毁。"""
+        """关闭窗口：先保存会话缓存，关闭音频子系统，再销毁并强制退出。"""
         try:
             self._save_session_cache()
         except Exception:
             pass
         try:
+            ae.shutdown()
+        except Exception:
+            pass
+        try:
             self.root.destroy()
+        except Exception:
+            pass
+        # 兜底：无论是否有残留原生线程（SDL 音频等），都强制结束进程，
+        # 避免关闭窗口后 DouKunStudio 仍在后台运行。
+        try:
+            import os
+            os._exit(0)
         except Exception:
             pass
 

@@ -5,8 +5,8 @@ __pycache__/
 *$py.class
 
 # ===== 构建产物（单文件 exe 不入库） =====
-dist/
 build/
+dist/
 *.spec~
 
 # ===== 采样数据与离线 wheel（非源码） =====

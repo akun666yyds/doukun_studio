@@ -606,6 +606,25 @@ def stop():
     _player['want_play'] = False
 
 
+def shutdown():
+    """彻底关闭音频子系统，确保退出时进程干净终止。
+
+    关闭主窗口时 pygame 的 SDL 音频线程（原生线程）不会随 Tk 销毁而退出，
+    会导致 DouKunStudio 进程残留在后台。这里先停播再退出 mixer，
+    让 SDL 释放音频设备、原生线程随之结束。
+    """
+    try:
+        stop()
+    except Exception:
+        pass
+    try:
+        import pygame
+        if pygame.mixer.get_init():
+            pygame.mixer.quit()
+    except Exception:
+        pass
+
+
 def seek(project, step, root=None):
     """跳转：播放中则无缝从新位置重播；暂停/停止则仅记忆位置（下次必然从该位置发声）。"""
     step = max(0.0, min(float(step), project.total_steps))

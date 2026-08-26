@@ -526,25 +526,138 @@ def setup_custom_titlebar(root, app_ref=None, title='DouKunStudio'):
     """
     if sys.platform != 'win32':
         return None
+    u = ctypes.windll.user32
+    # 声明 Win32 API 的参数/返回类型：64 位窗口句柄（HWND）若被 ctypes 默认按 32 位
+    # c_int 处理，会被截断成「无效窗口」，导致 SetWindowLongW/LoadImageW 静默失败，
+    # 任务栏按钮与图标都设置不上。必须显式声明 HWND/c_long 等类型。
     try:
-        root.overrideredirect(True)
+        u.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+        u.GetWindowLongW.restype = ctypes.c_long
+        # 64 位下取/设窗口过程必须用 *PtrW，否则过程指针被截断成 32 位 → 窗口崩溃
+        u.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+        u.GetWindowLongPtrW.restype = ctypes.c_void_p
+        u.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
+        u.SetWindowLongW.restype = ctypes.c_long
+        u.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+        u.SetWindowLongPtrW.restype = ctypes.c_void_p
+        u.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int,
+                                   ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
+        u.SetWindowPos.restype = wintypes.BOOL
+        u.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        u.SendMessageW.restype = wintypes.LPARAM
+        u.CallWindowProcW.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT,
+                                      wintypes.WPARAM, wintypes.LPARAM]
+        u.CallWindowProcW.restype = ctypes.c_longlong
+        u.LoadImageW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR, wintypes.UINT,
+                                 ctypes.c_int, ctypes.c_int, wintypes.UINT]
+        u.LoadImageW.restype = wintypes.HANDLE
     except Exception:
-        return None
+        pass
+
+    # 关键：绝不能用 overrideredirect(True)。它会把窗口变成「无主 popup」，
+    # 既不进任务栏、也不进 Alt-Tab，切屏后就再也调不回来（用户已踩坑）。
+    # 正确做法：保留窗口为「受系统管理的普通重叠窗口」（自动拥有任务栏按钮与
+    # Alt-Tab 条目，可被切屏召回），仅通过样式去掉原生标题栏(WS_CAPTION)与
+    # 可拖拽边框(WS_THICKFRAME)，再自己画抖音故障风标题栏。
+    try:
+        root.update_idletasks()
+        hwnd = root.winfo_id()
+        GWL_STYLE = -16
+        WS_CAPTION = 0x00C00000
+        WS_THICKFRAME = 0x00040000
+        style = u.GetWindowLongW(hwnd, GWL_STYLE)
+        style &= ~WS_CAPTION
+        style &= ~WS_THICKFRAME
+        u.SetWindowLongW(hwnd, GWL_STYLE, style)
+
+        GWL_EXSTYLE = -20
+        WS_EX_APPWINDOW = 0x00040000
+        ex = u.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        u.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_APPWINDOW)
+    except Exception:
+        pass
+
+    # ---- 子类化 WndProc：处理 WM_NCCALCSIZE，让客户区覆盖整个窗口 ----
+    # 只去掉 WS_CAPTION 而不处理 WM_NCCALCSIZE，Windows 仍会保留一段原生
+    # 非客户区（标题栏区域）在自定义栏下方，形成「双层眉头」。把 rgrc[0]
+    # （客户区）对齐到 rgrc[1]（整个窗口），即可彻底消除这段残留区域。
+    try:
+        hwnd = root.winfo_id()
+        GWL_WNDPROC = -4
+        WM_NCCALCSIZE = 0x0083
+
+        class _RECT(ctypes.Structure):
+            _fields_ = [('left', ctypes.c_long), ('top', ctypes.c_long),
+                        ('right', ctypes.c_long), ('bottom', ctypes.c_long)]
+
+        class _NCCALCSIZE_PARAMS(ctypes.Structure):
+            _fields_ = [('rgrc', _RECT * 3), ('lppos', ctypes.c_void_p)]
+
+        old_proc = u.GetWindowLongPtrW(hwnd, GWL_WNDPROC)
+
+        WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_longlong, wintypes.HWND,
+                                     wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+
+        def _wnd_proc(h, msg, wp, lp):
+            if msg == WM_NCCALCSIZE and wp:
+                try:
+                    params = ctypes.cast(lp, ctypes.POINTER(_NCCALCSIZE_PARAMS)).contents
+                    # 客户区 = 整个窗口（去掉顶部原生标题栏预留区）
+                    params.rgrc[0].left = params.rgrc[1].left
+                    params.rgrc[0].top = params.rgrc[1].top
+                    params.rgrc[0].right = params.rgrc[1].right
+                    params.rgrc[0].bottom = params.rgrc[1].bottom
+                except Exception:
+                    pass
+                return 0
+            return u.CallWindowProcW(old_proc, h, msg, wp, lp)
+
+        new_proc = WNDPROC(_wnd_proc)
+        u.SetWindowLongPtrW(hwnd, GWL_WNDPROC, new_proc)
+        # 保持引用，避免回调被 GC 后 Windows 调用悬空 thunk 崩溃
+        root._dk_wndproc = new_proc
+        root._dk_oldproc = old_proc
+    except Exception:
+        pass
+
+    # ---- 重新应用尺寸变更，使 WM_NCCALCSIZE 立即生效 ----
+    try:
+        hwnd = root.winfo_id()
+        SWP_NOMOVE = 0x0002
+        SWP_NOSIZE = 0x0001
+        SWP_NOZORDER = 0x0004
+        SWP_FRAMECHANGED = 0x0020
+        u.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+                       SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED)
+    except Exception:
+        pass
 
     titlebar = tk.Frame(root, bg=BLACK, height=34)
     titlebar.pack(side=tk.TOP, fill=tk.X)
     titlebar.pack_propagate(False)
 
-    # ---- 左侧抖音故障风 Logo ----
-    logo_w = 260
+    # ---- 左侧：程序图标 + 抖音故障风标题 ----
+    logo_w = 290
     canvas = tk.Canvas(titlebar, width=logo_w, height=34, bg=BLACK,
                        highlightthickness=0, cursor='size')
-    canvas.pack(side=tk.LEFT, padx=(10, 0))
+    canvas.pack(side=tk.LEFT, padx=(6, 0))
+
+    # 程序图标（由 icon_1024.png 派生，避免依赖 TK 对 .ico 的加载能力）
+    try:
+        ico_dir = getattr(sys, '_MEIPASS', '') or os.path.dirname(os.path.abspath(__file__))
+        icon_png = os.path.join(ico_dir, 'assets', 'icon_1024.png')
+        if os.path.exists(icon_png):
+            img = tk.PhotoImage(file=icon_png)
+            img = img.subsample(46)  # 1024 → 约 22px
+            canvas.create_image(12, 17, image=img, anchor='center')
+            canvas._dk_icon_img = img  # 防止被 GC
+    except Exception:
+        pass
 
     font = (FONT_FAMILY, 15, 'bold')
-    x = 0
+    x = 32
     y = 18
-    # 先画两层偏移重影，再画白色主体
+    # 先画两层偏移重影，再画白色主体（标题置于图标右侧）
     canvas.create_text(x - 2, y, text=title, font=font, fill=CYAN,
                        anchor='w', tags='title')
     canvas.create_text(x + 2, y, text=title, font=font, fill=MAGENTA,
@@ -590,13 +703,21 @@ def setup_custom_titlebar(root, app_ref=None, title='DouKunStudio'):
             pass
 
     def _close():
-        if app_ref is not None and hasattr(app_ref, '_on_close'):
-            try:
+        # 优先走主程序的干净关闭（保存会话 + 关音频 + 销毁 + 强制退出）；
+        # 若任何环节异常，这里兜底直接销毁并强制结束进程，杜绝关闭后残留后台进程。
+        try:
+            if app_ref is not None and hasattr(app_ref, '_on_close'):
                 app_ref._on_close()
-            except Exception:
+        except Exception:
+            try:
                 root.destroy()
-        else:
-            root.destroy()
+            except Exception:
+                pass
+        try:
+            import os
+            os._exit(0)
+        except Exception:
+            pass
 
     _make_btn('_', '#2A2D35', _minimize)
     _make_btn('□', '#2A2D35', _toggle_maximize)
@@ -631,27 +752,27 @@ def setup_custom_titlebar(root, app_ref=None, title='DouKunStudio'):
         w.bind('<ButtonRelease-1>', _stop_drag)
         w.bind('<Double-Button-1>', _on_double)
 
-    # ---- 任务栏图标兜底：再次通过 HWND 设置 exe 图标 ----
+    # ---- 任务栏图标：通过 HWND 设置 exe 图标（使用顶层窗口自身 HWND）----
     try:
         root.update_idletasks()
-        hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+        hwnd = root.winfo_id()
         if hwnd:
-            # WM_SETICON: ICON_BIG=1, ICON_SMALL=0
             WM_SETICON = 0x0080
             ICON_BIG = 1
             ICON_SMALL = 0
-            # 尝试从 assets/icon.ico 加载图标句柄
+            IMAGE_ICON = 1
+            LR_LOADFROMFILE = 0x00000010
+            LR_DEFAULTSIZE = 0x00002000
             ico_path = getattr(sys, '_MEIPASS', '')
             if not ico_path:
                 ico_path = os.path.dirname(os.path.abspath(__file__))
             ico_file = os.path.join(ico_path, 'assets', 'icon.ico')
             if os.path.exists(ico_file):
-                hicon = ctypes.windll.user32.LoadImageW(
-                    None, ico_file, 1,  # IMAGE_ICON=1
-                    0, 0, 0x00000010 | 0x00002000)  # LR_LOADFROMFILE | LR_DEFAULTSIZE
+                hicon = u.LoadImageW(None, ico_file, IMAGE_ICON, 0, 0,
+                                     LR_LOADFROMFILE | LR_DEFAULTSIZE)
                 if hicon:
-                    ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon)
-                    ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon)
+                    u.SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon)
+                    u.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon)
     except Exception:
         pass
 
