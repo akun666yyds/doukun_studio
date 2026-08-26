@@ -165,10 +165,11 @@ class App:
 
         setup_theme(root)
         set_dark_titlebar(root)
-        setup_custom_titlebar(root, self, title='DouKunStudio')
+        # 用户硬性要求：一律使用 Tk 默认标题栏，不做任何自定义标题栏 / Win32 样式修改。
         root.title('抖坤音乐工坊 · DouKunStudio')
         root.geometry('1380x880')
         root.configure(bg=BLACK)
+        self._titlebar = None  # 自定义标题栏已弃用，纯用 Tk 默认
 
         # 设置窗口图标（兼容源码运行与 PyInstaller 单文件）
         assets_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets')
@@ -259,13 +260,12 @@ class App:
         self._prepare_after = None
         self._want_auto_play = False
         self._freeze_with_overlay('正在初始化音频引擎…')
-        try:
-            ae._ensure_mixer()
-        except Exception:
-            pass
 
         def _startup_work():
             try:
+                # 音频引擎初始化移到后台线程：pygame.mixer.init() 若在 App.__init__ 主线程
+                # 被阻塞，会令 mainloop 永不启动 → 点击关闭无响应 → 系统判异常退出。
+                ae._ensure_mixer()
                 # 冻结（单文件 exe）后 samples 目录只读，无法写静态音色库；
                 # 实际播放已由即时合成兜底，故跳过校验/重建，直接走合成路径。
                 if not getattr(sys, 'frozen', False):
@@ -391,10 +391,8 @@ class App:
 
     # ---------------- 菜单（自绘，避免 Windows 原生菜单栏强制浅色） ----------------
     def _build_menu(self):
-        menubar = tk.Frame(self.root, bg=INPUT, height=28)
-        menubar.pack(side=tk.TOP, fill=tk.X)
-        menubar.pack_propagate(False)
-
+        """标准 Tk 菜单栏（挂在默认标题栏内）。不再自定义标题栏/菜单。"""
+        menubar = tk.Menu(self.root)
         filemenu = tk.Menu(menubar, tearoff=0, bg=SURFACE, fg=WHITE,
                            activebackground=MAGENTA, activeforeground=WHITE)
         filemenu.add_command(label='新建', command=self.new_project)
@@ -404,6 +402,7 @@ class App:
         filemenu.add_separator()
         filemenu.add_command(label='导出 WAV', command=self.export_wav)
         filemenu.add_command(label='生成音色库（静态文件）', command=self.build_samples)
+        menubar.add_cascade(label='文件', menu=filemenu)
 
         helpmenu = tk.Menu(menubar, tearoff=0, bg=SURFACE, fg=WHITE,
                            activebackground=MAGENTA, activeforeground=WHITE)
@@ -411,30 +410,10 @@ class App:
         helpmenu.add_separator()
         helpmenu.add_command(label='问题报告', command=self.show_problem_report)
         helpmenu.add_command(label='关于', command=self.show_about)
+        menubar.add_cascade(label='帮助', menu=helpmenu)
 
-        def _menu_label(text, menu):
-            lbl = tk.Label(menubar, text=text, bg=INPUT, fg=WHITE,
-                           font=FONT_UI, padx=12, pady=2, cursor='hand2')
-            lbl.pack(side=tk.LEFT)
-
-            def _open(_):
-                lbl.configure(bg=MAGENTA)
-                try:
-                    menu.post(lbl.winfo_rootx(),
-                              lbl.winfo_rooty() + lbl.winfo_height())
-                finally:
-                    lbl.after(80, lambda: lbl.configure(bg=INPUT))
-
-            def _enter(_): lbl.configure(bg='#3A3A3A')
-            def _leave(_): lbl.configure(bg=INPUT)
-
-            lbl.bind('<Button-1>', _open)
-            lbl.bind('<Enter>', _enter)
-            lbl.bind('<Leave>', _leave)
-            return lbl
-
-        self._menu_file = _menu_label('文件', filemenu)
-        self._menu_help = _menu_label('帮助', helpmenu)
+        self.root.config(menu=menubar)
+        self._saved_menu = menubar  # 供预览窗口临时隐藏菜单后恢复
 
     # ---------------- 撤销 / 热键 ----------------
     def _bind_hotkeys(self):
@@ -560,24 +539,13 @@ class App:
             pass
 
     def _on_close(self):
-        """关闭窗口：先保存会话缓存，关闭音频子系统，再销毁并强制退出。"""
+        """关闭窗口：先保存会话缓存，再销毁（与已验证「退出不卡死」的老版本一致）。"""
         try:
             self._save_session_cache()
         except Exception:
             pass
         try:
-            ae.shutdown()
-        except Exception:
-            pass
-        try:
             self.root.destroy()
-        except Exception:
-            pass
-        # 兜底：无论是否有残留原生线程（SDL 音频等），都强制结束进程，
-        # 避免关闭窗口后 DouKunStudio 仍在后台运行。
-        try:
-            import os
-            os._exit(0)
         except Exception:
             pass
 
@@ -619,10 +587,18 @@ class App:
         content.columnconfigure(0, weight=1)
         cw = cv.create_window((0, 0), window=content, anchor='nw')
 
+        _last_cw_w = [0]
+
         def _sync_scroll(_):
+            if not cv.winfo_exists():
+                return
             cv.configure(scrollregion=cv.bbox('all'))
             try:
-                cv.itemconfig(cw, width=cv.winfo_width())
+                w = cv.winfo_width()
+                # 仅在宽度真正变化时才改嵌入窗宽，破除 content<->cv 的 <Configure> 重入环
+                if abs(w - _last_cw_w[0]) > 1:
+                    _last_cw_w[0] = w
+                    cv.itemconfig(cw, width=w)
             except Exception:
                 pass
         content.bind('<Configure>', _sync_scroll)
@@ -930,8 +906,14 @@ class App:
         win.grab_set()
 
         def _close():
-            ae.preview_stop()
-            win.destroy()
+            try:
+                ae.preview_stop()
+            except Exception:
+                pass
+            try:
+                win.destroy()
+            except Exception:
+                pass
         win.protocol('WM_DELETE_WINDOW', _close)
 
         # 顶部标题
@@ -958,7 +940,7 @@ class App:
         type_cb.current(0)
 
         tk.Label(left, text='DLC 名称', font=(FONT_FAMILY, 13), fg=TEXT_SECONDARY, bg=BLACK).pack(anchor='w', pady=(16, 4))
-        name_var = tk.StringVar(value='我的音色')
+        name_var = tk.StringVar(value='新音色')
         tk.Entry(left, textvariable=name_var, width=28, bg=INPUT, fg=WHITE,
                  insertbackground=WHITE, font=(FONT_FAMILY, 13)).pack(anchor='w')
 
@@ -1030,6 +1012,8 @@ class App:
         load_cb = ttk.Combobox(left, values=dlc_labels, state='readonly', width=26, font=(FONT_FAMILY, 12))
         load_cb.pack(anchor='w')
         load_cb.current(0)
+        uuid_var = tk.StringVar(value='UUID: —')
+        tk.Label(left, textvariable=uuid_var, font=(FONT_FAMILY, 10), fg=TEXT_MUTED, bg=BLACK).pack(anchor='w')
         editing_key = {'key': None, 'orig_name': None}   # 当前是否处于「编辑已有 DLC」模式
 
         def _load_dlc_info(e=None):
@@ -1037,12 +1021,13 @@ class App:
             if idx <= 0:
                 editing_key['key'] = None
                 editing_key['orig_name'] = None
-                name_var.set('我的音色')
+                name_var.set('新音色')
                 type_cb.current(0)
                 build_sliders('sine')
                 chord_state['offsets'] = set([0])
                 on_preset()
                 status.set('已重置为新建音色')
+                uuid_var.set('UUID: —')
                 return
             key = dlc_keys[idx - 1]
             info = synth_factory.load_dlc_for_edit(key)
@@ -1051,6 +1036,7 @@ class App:
                 return
             editing_key['key'] = key
             editing_key['orig_name'] = info['name']
+            uuid_var.set('UUID: %s' % key)
             name_var.set(info['name'])
             t = info['type']
             if t in synth_factory.SYNTH_TYPES:
@@ -1086,8 +1072,10 @@ class App:
             dlc_keys[:] = new_keys
             if editing_key.get('key') in new_keys:
                 load_cb.current(new_keys.index(editing_key['key']) + 1)
+                uuid_var.set('UUID: %s' % editing_key['key'])
             else:
                 load_cb.current(0)
+                uuid_var.set('UUID: —')
 
         status = tk.StringVar(value='就绪：调好参数后点「试听」')
         tk.Label(left, textvariable=status, font=(FONT_FAMILY, 12), fg=CYAN, bg=BLACK,
@@ -1120,7 +1108,7 @@ class App:
             except Exception as e:
                 status.set('合成失败：%r' % e)
                 return
-            ae.preview_raw(sig, loops=-1)
+            ae.preview_raw(sig, loops=-1, root=self.root)
             status.set('试听中：%s @ %s 和弦[%s]' % (
                 synth_factory.TYPE_LABELS[t], synth.note_name(midi),
                 ','.join(str(o) for o in offs)))
@@ -1144,18 +1132,11 @@ class App:
             offs = sorted(chord_state['offsets']) or [0]
             chord = offs if len(offs) > 1 else None   # 单音不写 chord 字段
 
-            def _confirm_overwrite(nm, k):
-                # 模态窗口先释放 grab，避免消息框被卡死，结束再重新 grab
-                win.grab_release()
-                ans = messagebox.askyesno(
-                    '覆盖确认',
-                    '库内已存在同名音色「%s」(%s.py)。\n\n'
-                    '• 是 → 覆盖原文件\n'
-                    '• 否 → 另存为「%s_2.py」' % (nm, k, k),
-                    parent=win)
-                win.grab_set()
-                return ans
-
+            # 撞名处理：新建时若名称与库内已有 DLC 同名，直接覆盖该同名 DLC
+            # （不弹「另存为」生成 _2 副本）。原因：原逻辑另存为会产生 label 仍写
+            # 原名的副本，选择器出现多个同名「我的音色」，用户误选原始版本 → 表现为
+            # 「设定固定、改不了」。覆盖同名即「你取了这个名，就用你的设定」，符合直觉。
+            # 回炉重造（editing_key 已设）走 resolve_dlc_save 的 'edit' 分支，同样覆盖原文件。
             key, action = synth_factory.resolve_dlc_save(
                 name,
                 editing_key=editing_key.get('key'),
@@ -1163,13 +1144,16 @@ class App:
                 dlc_keys=synth.DLC_KEYS,
                 dlc_dir=synth.DLC_DIR,
                 builtin_keys=set(synth.INSTRUMENT_KEYS),
-                on_collide=_confirm_overwrite,
+                on_collide=lambda n, k: True,
             )
             # 覆盖 / 回炉：写入前先注销旧模块（确保加载最新版）；新建时 unregister 为 no-op
             if action in ('overwrite', 'edit') and key in synth.DLC_KEYS:
                 synth.unregister_dlc(key)
 
-            src = synth_factory.build_dlc_source(name, t, params, chord=chord)
+            # 极端情况下若走了 rename（如回炉时改名撞名），用唯一 key 作 label，避免同名混淆
+            src = synth_factory.build_dlc_source(
+                name, t, params, chord=chord,
+                label=(key if action == 'rename' else None))
             path = synth_factory.write_dlc(key, src)
             synth.load_dlc_folder()   # 注册进内核（即插即用）
             ae.preview_stop()
@@ -1505,8 +1489,14 @@ class App:
         win.grab_set()
 
         def _close():
-            ae.preview_stop()
-            win.destroy()
+            try:
+                ae.preview_stop()
+            except Exception:
+                pass
+            try:
+                win.destroy()
+            except Exception:
+                pass
         win.protocol('WM_DELETE_WINDOW', _close)
 
         # 顶部标题栏
@@ -1517,6 +1507,8 @@ class App:
         self._picker_hint = tk.Label(hdr, text='点住卡片连续试听 · 松手即停 · 选好点「✓ 选用」',
                                       font=F_HINT, fg=CYAN, bg=BLACK)
         self._picker_hint.pack(side=tk.RIGHT)
+        uuid_lbl = tk.Label(hdr, text='UUID: —', font=F_HINT, fg=TEXT_MUTED, bg=BLACK)
+        uuid_lbl.pack(side=tk.RIGHT, padx=(0, 14))
         RoundedButton(hdr, text='📥 刷新 DLC', style='cyan', width=130, height=30, font=F_HINT,
                       command=lambda: (synth.reload_dlc(), build_body(),
                                       self.set_status('已刷新 DLC 文件夹'))
@@ -1620,6 +1612,8 @@ class App:
                                           width=btn_w, height=btn_h, font=F_BTN)
                         b.bind('<Button-1>', lambda e, kk=k: start_hold(kk))
                         b.bind('<ButtonRelease-1>', lambda e: stop_hold())
+                        b.bind('<Enter>', lambda e, kk=k: uuid_lbl.configure(text='UUID: %s' % kk))
+                        b.bind('<Leave>', lambda e: uuid_lbl.configure(text='UUID: —'))
                         b.pack(side=tk.LEFT, padx=(0, 8))
                         buttons[k] = b
                         RoundedButton(row, text='🗑 删除', style='default', width=90, height=36, font=F_HINT,
@@ -1636,6 +1630,8 @@ class App:
                         # 点住=连续试听，松手=停止（不绑定 command，避免点击即提交）
                         b.bind('<Button-1>', lambda e, kk=k: start_hold(kk))
                         b.bind('<ButtonRelease-1>', lambda e: stop_hold())
+                        b.bind('<Enter>', lambda e, kk=k: uuid_lbl.configure(text='UUID: %s' % kk))
+                        b.bind('<Leave>', lambda e: uuid_lbl.configure(text='UUID: —'))
                         b.grid(row=r, column=c, padx=6, pady=6, sticky='ew')
                         buttons[k] = b
                         c += 1
@@ -1649,7 +1645,7 @@ class App:
             cv.configure(scrollregion=cv.bbox('all'))
 
         build_body()
-        body.bind('<Configure>', lambda e: cv.configure(scrollregion=cv.bbox('all')))
+        body.bind('<Configure>', lambda e: cv.configure(scrollregion=cv.bbox('all')) if cv.winfo_exists() else None)
 
         # 鼠标滚轮：在画布区和窗口任意处都能滚动；在画布区消费事件避免双重滚动
         def _on_wheel(e):
@@ -2071,7 +2067,13 @@ def run_headless_smoke_test():
             meipass = getattr(sys, '_MEIPASS', '')
             check('assets_bundled', os.path.isfile(os.path.join(meipass, 'assets', 'icon.ico')),
                   meipass)
-            check('dlc_bundled', os.path.isdir(os.path.join(meipass, 'instrument_dlc')))
+            # 用户要求：不再打包任何预设示例 DLC，exe 内 instrument_dlc 不应含历史预设
+            bundled_dlc = os.path.join(meipass, 'instrument_dlc')
+            preset_names = {'Caesar', '我的音色', '蔡徐坤'}
+            _has_preset = (os.path.isdir(bundled_dlc) and
+                           any(fn[:-3] in preset_names for fn in os.listdir(bundled_dlc)
+                               if fn.endswith('.py')))
+            check('dlc_no_preset_bundled', not _has_preset, bundled_dlc)
             # 冻结后 DLC 目录必须可写（不等于只读的 _MEIPASS）
             dlc_ok = (synth.DLC_DIR != os.path.join(meipass, 'instrument_dlc')
                       and os.access(synth.DLC_DIR, os.W_OK))
@@ -2120,42 +2122,38 @@ def run_headless_smoke_test():
         except Exception as e:
             check('dlc_render_numpy', False, repr(e))
 
-        # ---- 2c) DLC 保存文件名解析：不同名称→不同文件、改名不覆盖旧文件、同名→提示/另存 ----
-        # 这是修复「总是写入旧 dlc 文件名」的核心逻辑（resolve_dlc_save 纯函数，可无 GUI 断言）。
+        # ---- 2c) DLC 保存文件名解析：用户 DLC 主键一律 32 位随机 UUID（与名称解耦）----
+        # resolve_dlc_save 纯函数，可无 GUI 断言。
         try:
+            import re as _re
+            _uuid_re = _re.compile(r'^[0-9a-f]{32}$')
             cd = synth.DLC_DIR
             existing_keys = set(synth.DLC_KEYS)
             builtin = set(synth.INSTRUMENT_KEYS)
-            # 清空可能存在的同名测试文件，隔离环境（用 delete_dlc 走 ctypes 兜底，
-            # 规避沙箱 safe-delete shim 对裸 os.remove 的拦截）
+            # 隔离环境
             for tkey in ('rs_a', 'rs_b', 'rs_x', 'rs_x_2', 'rs_y', 'rs_a_2'):
                 synth.delete_dlc(tkey)
-            # 场景1：新建两个不同名称 → 各自独立文件 key（修复前会复用同一个旧 key）
+            # 场景1：新建两个不同名称 → 各自独立的 32 位 uuid key（绝不撞名）
             k_a, a_a = synth_factory.resolve_dlc_save('rs_a', editing_key=None,
                 editing_name=None, dlc_keys=existing_keys, dlc_dir=cd, builtin_keys=builtin)
             k_b, a_b = synth_factory.resolve_dlc_save('rs_b', editing_key=None,
                 editing_name=None, dlc_keys=existing_keys, dlc_dir=cd, builtin_keys=builtin)
-            s1 = (k_a == 'rs_a' and a_a == 'new' and k_b == 'rs_b' and a_b == 'new'
+            s1 = (a_a == 'new' and a_b == 'new'
+                  and bool(_uuid_re.match(k_a)) and bool(_uuid_re.match(k_b))
                   and k_a != k_b)
-            # 场景2：回炉重造同名 → 覆盖原 key
-            k_e, a_e = synth_factory.resolve_dlc_save('rs_x', editing_key='rs_x',
+            # 场景2：回炉重造（editing_key=某 uuid）→ 返回同一 uuid，覆盖原文件
+            ek = synth_factory.new_dlc_key()
+            k_e, a_e = synth_factory.resolve_dlc_save('rs_x', editing_key=ek,
                 editing_name='rs_x', dlc_keys=existing_keys, dlc_dir=cd, builtin_keys=builtin)
-            s2 = (k_e == 'rs_x' and a_e == 'edit')
-            # 场景3：回炉重造但改了名 → 另存为新文件（不覆盖原 rs_x）
-            k_r, a_r = synth_factory.resolve_dlc_save('rs_y', editing_key='rs_x',
+            s2 = (k_e == ek and a_e == 'edit')
+            # 场景3：回炉重造但改了名 → 仍保持同一 uuid（uuid 才是身份），覆盖原文件
+            k_r, a_r = synth_factory.resolve_dlc_save('rs_y', editing_key=ek,
                 editing_name='rs_x', dlc_keys=existing_keys, dlc_dir=cd, builtin_keys=builtin)
-            s3 = (k_r == 'rs_y' and a_r == 'new' and k_r != 'rs_x')
-            # 场景4：同名冲突（先造一个 rs_a.py）→ on_collide 返回 False → 另存 rs_a_2
-            synth_factory.write_dlc('rs_a', synth_factory.build_dlc_source('rs_a', 'sine', {}))
-            k_c, a_c = synth_factory.resolve_dlc_save('rs_a', editing_key=None,
-                editing_name=None, dlc_keys=existing_keys, dlc_dir=cd, builtin_keys=builtin,
-                on_collide=lambda nm, kk: False)
-            s4 = (k_c == 'rs_a_2' and a_c == 'rename')
-            # 清理场景4残留
-            synth.delete_dlc('rs_a')
-            synth.delete_dlc('rs_a_2')
+            s3 = (k_r == ek and a_r == 'edit')
+            # 场景4：uuid 主键绝不撞内置名、格式合规
+            s4 = (ek not in builtin) and bool(_uuid_re.match(ek))
             check('dlc_save_key_resolution', s1 and s2 and s3 and s4,
-                  'new_distinct=%s edit_same=%s rename_on_edit=%s collide_rename=%s'
+                  'new_distinct=%s edit_same=%s rename_on_edit=%s uuid_safe=%s'
                   % (s1, s2, s3, s4))
         except Exception as e:
             check('dlc_save_key_resolution', False, repr(e))
@@ -2193,11 +2191,11 @@ def run_headless_smoke_test():
             one1 = synth.render_one_shot(k1, 60, synth_factory.SR, 0.5)
             used_ok = (k1 in synth.DLC_KEYS) and (one1.size > 0) and float(np.max(np.abs(np.asarray(one1)))) > 0.01
 
-            # 场景2：同名冲突 → on_collide=False → 另存 <base>_2（绝不覆盖原文件）
+            # 场景2：同名再建 → UUID 主键下永不撞名，得到另一个全新 uuid（绝不覆盖原文件）
             k2, a2 = synth_factory.resolve_dlc_save('lifecycle_a', editing_key=None, editing_name=None,
                 dlc_keys=set(synth.DLC_KEYS), dlc_dir=cd, builtin_keys=set(synth.INSTRUMENT_KEYS),
                 on_collide=lambda n, k: False)
-            renamed_ok = (a2 == 'rename') and (k2 != k1) and (k2 not in synth.INSTRUMENT_KEYS)
+            renamed_ok = (a2 == 'new') and (k2 != k1) and (k2 not in synth.INSTRUMENT_KEYS)
             synth_factory.write_dlc(k2, synth_factory.build_dlc_source('lifecycle_a', 'sine', {}))
             created.add(k2)
             synth.load_dlc_folder()
@@ -2308,15 +2306,15 @@ def run_headless_smoke_test():
         except Exception as e:
             check('synth_types_coverage', False, repr(e))
 
-        # ---- 3) 内置 DLC 即插即用（示例音色应已被注册） ----
+        # ---- 3) DLC 注册机制可用（预设示例已移除，不再假定特定音色） ----
         try:
             synth.load_dlc_folder()
-            expected = {'Caesar', '我的音色', '蔡徐坤'}
             have = set(synth.DLC_KEYS)
-            check('builtin_dlc_registered', expected.issubset(have),
-                  'missing=%s' % (expected - have))
+            # 已移除内置示例 DLC：仅验证注册表可用、加载不崩，不要求特定预设存在
+            check('dlc_registry_loads', isinstance(have, set),
+                  'DLC_KEYS count=%d' % len(have))
         except Exception as e:
-            check('builtin_dlc_registered', False, repr(e))
+            check('dlc_registry_loads', False, repr(e))
 
         # ---- 4) 工程保存 / 加载往返（程序内缓存的数据层） ----
         try:
@@ -2390,7 +2388,6 @@ def main():
     # 不设会导致任务栏分组错乱、固定图标失效、显示异常。固定身份即可让
     # 文件夹/任务栏/标题栏统一使用本程序图标。
     try:
-        import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
             'DouKunStudio.DAW.1.0')
     except Exception:

@@ -136,7 +136,7 @@ try:
     except Exception as e:
         check('cn_dlc', False, 'EXC %r' % e)
 
-    # resolve_dlc_save：回炉重造同名 / 改名另存 / 同名冲突
+    # resolve_dlc_save：回炉重造（同名或改名）→ 保持同一 uuid 主键
     try:
         k1, a1 = sf.resolve_dlc_save('测试A', editing_key=None, editing_name=None,
                                       dlc_keys=set(synth.DLC_KEYS), dlc_dir=tmp_dir,
@@ -147,7 +147,7 @@ try:
         k3, a3 = sf.resolve_dlc_save('测试B', editing_key=k1, editing_name='测试A',
                                       dlc_keys=set(synth.DLC_KEYS), dlc_dir=tmp_dir,
                                       builtin_keys=set(synth.INSTRUMENT_KEYS))
-        ok = (a1 == 'new') and (a2 == 'edit') and (a3 == 'new') and (k2 == k1) and (k3 != k1)
+        ok = (a1 == 'new') and (a2 == 'edit') and (a3 == 'edit') and (k2 == k1) and (k3 == k1)
         check('resolve_cn', ok, 'a1=%s a2=%s a3=%s' % (a1, a2, a3))
     except Exception as e:
         check('resolve_cn', False, 'EXC %r' % e)

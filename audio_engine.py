@@ -401,16 +401,68 @@ def export_wav(project, path):
 # - _ensure_mixer 在启动时尽早调用，避免首次点击播放时才初始化音频设备造成数秒卡顿。
 # - 新增 prepare_project：后台预渲染整曲，播放时只要缓存命中即可立即切片发声。
 # - start/resume/seek 在缓存未命中时会后台渲染，并通过 root.after 回到主线程自动播放。
-def _ensure_mixer():
-    import pygame
+# ---- 混音器初始化：只尝试一次，且一定在后台线程进行（关键，避免主线程卡死）----
+_mixer_ready = threading.Event()      # 置位表示 init 已尝试完毕（成功或失败）
+_mixer_init_started = False           # 保证 init 只发起一次
+_mixer_init_lock = threading.Lock()
+
+
+def _mixer_init_blocking():
+    """在后台线程真正执行 pygame.mixer.init()。
+
+    旧实现在主线程同步 init；若 init 在用户机器上阻塞/卡死，所有主线程调用点
+    （prepare_project/start/resume/preview_raw）都会被卡住 -> 窗口『未响应』 ->
+    点击关闭无法分发 WM_DELETE_WINDOW -> 被系统判为异常退出。移到后台线程即根除。
+    """
+    global _mixer_init_started
     try:
+        import pygame
         if not pygame.mixer.get_init():
             # 注意：pygame 实际强制立体声（2 通道），单声道字节会被当双声道 -> 速度翻倍。
             # 这里显式请求 2 通道，并在播放时按实际通道数构造 buffer。
             pygame.mixer.init(frequency=SR, size=-16, channels=2, buffer=2048)
     except Exception:
-        # 极少数无音频设备的环境：静默降级，不阻塞启动；播放不可用但 UI 正常。
+        # 极少数无音频设备环境：静默降级，不阻塞；播放不可用但 UI 正常。
         pass
+    finally:
+        _mixer_ready.set()
+
+
+def _ensure_mixer():
+    """确保混音器最终会被初始化，但【绝不阻塞调用线程】。
+
+    - 已初始化：立即返回；
+    - 尚未初始化：若还没发起过，则在后台线程发起 init（只一次），立即返回；
+      已发起过则直接返回（绝不重复 pygame.mixer.init()）。
+    需要真正播放时请用 _run_when_mixer_ready 等待就绪，不要在调用线程同步等 init。
+    """
+    import pygame
+    if pygame.mixer.get_init():
+        _mixer_ready.set()
+        return
+    global _mixer_init_started
+    with _mixer_init_lock:
+        if _mixer_init_started:
+            return
+        _mixer_init_started = True
+    threading.Thread(target=_mixer_init_blocking, daemon=True).start()
+
+
+def _run_when_mixer_ready(fn, root=None, _delay=40):
+    """混音器就绪后在【主线程】执行 fn；未就绪则短暂轮询重试（绝不阻塞调用线程）。
+
+    - root 非空：用 root.after 回到主线程轮询（播放类操作须在主线程）；
+    - root 为空（罕见）：用后台定时器轮询，fn 在后台线程执行（仅 pygame 操作，安全）。
+    轮询上限由 _mixer_ready（init 失败也会置位）保证一定终止，不会成死循环。
+    """
+    if _mixer_ready.is_set():
+        fn()
+        return
+    if root is not None:
+        root.after(_delay, lambda: _run_when_mixer_ready(fn, root, _delay))
+    else:
+        threading.Timer(_delay / 1000.0,
+                        lambda: _run_when_mixer_ready(fn, root, _delay)).start()
 
 
 def _pcm_from_buf(buf):
@@ -470,6 +522,8 @@ def prepare_project(project, root=None, on_ready=None):
     def work():
         try:
             buf, sr = mix_project(project, sr=SR)
+            # 后台线程等待混音器就绪（不阻塞 UI）；init 失败也会置位 _mixer_ready -> 必有上限
+            _mixer_ready.wait(10.0)
             h2 = _project_hash(project)
             with _render_lock:
                 _player['full_pcm'] = _pcm_from_buf(buf)
@@ -529,51 +583,59 @@ def _start_from(step):
 def start(project, root=None, start_step=None):
     """停止态 -> 从 start_step（默认当前 playhead）开始播放。
 
-    若缓存命中则立即播放并返回 True；否则后台渲染，就绪后自动播放并返回 False。
+    若缓存命中则立即播放；否则后台渲染，就绪后自动播放。混音器初始化可能尚未
+    完成（首次在后台线程进行），故用 _run_when_mixer_ready 等就绪后再播，
+    绝不阻塞主线程。
     """
     _ensure_mixer()
-    h = _project_hash(project)
-    with _render_lock:
-        ready = (_player['project_hash'] == h and _player['full_pcm'] is not None)
-    if ready:
-        step = start_step if start_step is not None else _player.get('playhead_step', 0.0)
-        step = max(0.0, min(step, _player['total_steps']))
-        _start_from(step)
-        return True
 
-    # 缓存未命中：后台准备，完成后自动从指定位置播放
-    _player['want_play'] = True
-
-    def on_ready():
-        if _player.get('want_play'):
-            _player['want_play'] = False
+    def _go():
+        h = _project_hash(project)
+        with _render_lock:
+            ready = (_player['project_hash'] == h and _player['full_pcm'] is not None)
+        if ready:
             step = start_step if start_step is not None else _player.get('playhead_step', 0.0)
             step = max(0.0, min(step, _player['total_steps']))
             _start_from(step)
+            return
 
-    prepare_project(project, root=root, on_ready=on_ready)
-    return False
+        # 缓存未命中：后台准备，完成后自动从指定位置播放
+        _player['want_play'] = True
+
+        def on_ready():
+            if _player.get('want_play'):
+                _player['want_play'] = False
+                step = start_step if start_step is not None else _player.get('playhead_step', 0.0)
+                step = max(0.0, min(step, _player['total_steps']))
+                _start_from(step)
+
+        prepare_project(project, root=root, on_ready=on_ready)
+
+    _run_when_mixer_ready(_go, root=root)
 
 
 def resume(project, root=None):
     """暂停态 -> 从记录位置继续（重新切片，确保声音正确且对齐播放头）。"""
     _ensure_mixer()
-    h = _project_hash(project)
-    with _render_lock:
-        ready = (_player['project_hash'] == h and _player['full_pcm'] is not None)
-    if ready:
-        _start_from(_player.get('playhead_step', 0.0))
-        return True
 
-    _player['want_play'] = True
-
-    def on_ready():
-        if _player.get('want_play'):
-            _player['want_play'] = False
+    def _go():
+        h = _project_hash(project)
+        with _render_lock:
+            ready = (_player['project_hash'] == h and _player['full_pcm'] is not None)
+        if ready:
             _start_from(_player.get('playhead_step', 0.0))
+            return
 
-    prepare_project(project, root=root, on_ready=on_ready)
-    return False
+        _player['want_play'] = True
+
+        def on_ready():
+            if _player.get('want_play'):
+                _player['want_play'] = False
+                _start_from(_player.get('playhead_step', 0.0))
+
+        prepare_project(project, root=root, on_ready=on_ready)
+
+    _run_when_mixer_ready(_go, root=root)
 
 
 def pause(project):
@@ -730,12 +792,13 @@ def _preview_pcm_bytes(key, midi, velocity):
     return b
 
 
-def preview_note(key, midi, velocity=1.0, dur=None):
+def preview_note(key, midi, velocity=1.0, dur=None, root=None):
     """开始试听一个音：用当前乐器 key 合成 midi 音高的声音并独占声道播放。
     - tonal / vocal：循环播放直到 preview_stop()（实现「按多久响多久」）。
     - perc / fx：仅播放一次（短促，本就不适合持续发声）。
     音色 == 当前音轨乐器，音调 == midi，响度 == velocity（音标调用时传 1.0 即 100%）。
     合成结果按 (乐器, 音高, 响度) 缓存，杜绝每次点击/拖拽的重复重合成卡顿。
+    混音器初始化可能在后台进行，故等就绪后再播，不阻塞主线程（钢琴卷帘点击/拖拽频繁调用）。
     """
     import pygame
     _ensure_mixer()
@@ -746,21 +809,25 @@ def preview_note(key, midi, velocity=1.0, dur=None):
     mono = _preview_pcm_bytes(key, int(midi), float(velocity))
     if mono is None:
         return
-    # 声道复制在播放时（main 线程、mixer 已初始化）完成；缓存只存 mono
-    _, _, ch = pygame.mixer.get_init()
-    if ch == 2:
-        arr = np.frombuffer(mono, dtype='<i2')
-        stereo = np.column_stack([arr, arr]).ravel().tobytes()
-    else:
-        stereo = mono
-    preview_stop()  # 先停掉上一次，避免叠音
-    sound = pygame.mixer.Sound(stereo)
-    loops = -1 if kind in ('tonal', 'vocal') else 0
-    _preview['channel'] = sound.play(loops=loops)
-    _preview['sound'] = sound
-    _preview['key'] = key
-    _preview['midi'] = int(midi)
-    _preview['velocity'] = float(velocity)
+
+    def _go():
+        import pygame
+        _, _, ch = pygame.mixer.get_init()
+        if ch == 2:
+            arr = np.frombuffer(mono, dtype='<i2')
+            stereo = np.column_stack([arr, arr]).ravel().tobytes()
+        else:
+            stereo = mono
+        preview_stop()  # 先停掉上一次，避免叠音
+        sound = pygame.mixer.Sound(stereo)
+        loops = -1 if kind in ('tonal', 'vocal') else 0
+        _preview['channel'] = sound.play(loops=loops)
+        _preview['sound'] = sound
+        _preview['key'] = key
+        _preview['midi'] = int(midi)
+        _preview['velocity'] = float(velocity)
+
+    _run_when_mixer_ready(_go, root=root)
 
 
 def preview_set_pitch(key, midi, velocity=1.0):
@@ -784,30 +851,36 @@ def preview_stop():
         _preview[k] = None
 
 
-def preview_raw(wave, loops=-1):
+def preview_raw(wave, loops=-1, root=None):
     """试听任意一段生成好的单声道波形（float32/float64, -1..1）。
 
     主要用于「音色合成工坊」实时预览：用 synth_factory 即时合成 -> 直接播放，
     不经过 (乐器, 音高) 缓存。 tonal 传 loops=-1 持续循环直到 preview_stop()。
+    混音器初始化可能在后台进行，故等就绪后再播，不阻塞主线程。
     """
     import pygame
     _ensure_mixer()
     wave = np.asarray(wave, dtype=np.float64)
     wave = np.clip(wave, -1.0, 1.0)
     pcm = (wave * 32767.0).astype('<i2')
-    _, _, ch = pygame.mixer.get_init()
-    if ch == 2:
-        arr = pcm
-        stereo = np.column_stack([arr, arr]).ravel().tobytes()
-    else:
-        stereo = pcm.tobytes()
-    preview_stop()
-    sound = pygame.mixer.Sound(stereo)
-    _preview['channel'] = sound.play(loops=loops)
-    _preview['sound'] = sound
-    _preview['key'] = None
-    _preview['midi'] = None
-    _preview['velocity'] = None
+
+    def _go():
+        import pygame
+        _, _, ch = pygame.mixer.get_init()
+        if ch == 2:
+            arr = pcm
+            stereo = np.column_stack([arr, arr]).ravel().tobytes()
+        else:
+            stereo = pcm.tobytes()
+        preview_stop()
+        sound = pygame.mixer.Sound(stereo)
+        _preview['channel'] = sound.play(loops=loops)
+        _preview['sound'] = sound
+        _preview['key'] = None
+        _preview['midi'] = None
+        _preview['velocity'] = None
+
+    _run_when_mixer_ready(_go, root=root)
 
 
 def warm_preview_cache(key, midis):

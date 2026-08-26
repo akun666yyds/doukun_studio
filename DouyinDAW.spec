@@ -7,8 +7,8 @@
 
 说明：
 - console=False  -> 双击运行无黑色终端窗口（纯 GUI）。
-- datas 把 instrument_dlc/（用户可编辑的 DLC 音色库）与 assets/（图标）一起打进 exe；
-  首次运行会把示例 DLC 播种到可写目录（exe 同级或 LOCALAPPDATA），用户可生成/注册/编辑/删除。
+- datas 不再打包任何预设示例 DLC（用户要求：干净的 DLC 空间）。instrument_dlc/ 为空目录，
+  冻结后 _MEIPASS 内不含该目录，播种逻辑自动跳过；用户可自行生成/注册/编辑/删除音色。
 - 静态 samples/ 音色库不打包（约 336MB，且实际播放已由即时合成兜底，samples 仅作可选加速），
   故冻结后跳过静态库重建，exe 体积更小、启动更快。
 - upx=False：避免某些 Windows 杀软对 UPX 压缩体的误报，保证「双击即用、无依赖」。

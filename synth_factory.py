@@ -31,23 +31,20 @@ SR = 44100
 # 冻结（PyInstaller 单文件 exe）时，本模块被解压到临时只读目录（sys._MEIPASS），
 # 不能直接往里写 DLC——而用户需要「生成 / 注册 / 编辑 / 删除」DLC，目录必须可写。
 # 因此冻结后把 DLC_DIR 解析到可写位置：优先 exe 同级（便携），不可写则回退 LOCALAPPDATA。
-# 首次运行时，把打包进 exe 的示例 DLC（_MEIPASS/instrument_dlc）播种到可写目录，
-# 这样用户既可直接使用、也能编辑/删除这些 DLC（不破坏 exe 本体）。
+# 首次运行时，若 exe 内打包了 instrument_dlc（_MEIPASS/instrument_dlc）则播种到可写目录；
+# 现已不再打包任何示例 DLC，该目录为空，播种逻辑自动跳过——用户得到干净的 DLC 空间。
 def _resolve_dlc_dir():
     base = os.path.dirname(os.path.abspath(__file__))
     if getattr(sys, 'frozen', False):
+        # 用户要求：用户管理的 DLC 严格绑定 exe 同级 instrument_dlc/（便携、可写），
+        # 不再回退 LOCALAPPDATA，避免「打包时打错目录」导致 DLC 落到别处 / 与旧缓存混淆。
         exe_dir = os.path.dirname(os.path.abspath(sys.executable))
         cand = os.path.join(exe_dir, 'instrument_dlc')
         try:
             os.makedirs(cand, exist_ok=True)
-            probe = os.path.join(cand, '.writable_test')
-            with open(probe, 'w') as f:
-                f.write('1')
-            os.remove(probe)
-            return cand
         except Exception:
-            appdata = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
-            return os.path.join(appdata, 'DouKunStudio', 'instrument_dlc')
+            pass
+        return cand
     return os.path.join(base, 'instrument_dlc')
 
 
@@ -564,13 +561,28 @@ def slugify(name):
     return s[:48]
 
 
-def build_dlc_source(name, type_name, params, chord=None):
+def new_dlc_key():
+    """生成 32 位十六进制随机 UUID（16 字节），作为用户 DLC 文件的唯一主键。
+
+    展示名（label）与 uuid 主键彻底解耦：名称可任意重复、可改，永不撞名、
+    绝不复用旧文件，从根上消除「名称撞名 → 旧缓存/旧设定被复用」导致的
+    「设定固定、改不了」问题。
+    """
+    import secrets
+    return secrets.token_hex(16)
+
+
+def build_dlc_source(name, type_name, params, chord=None, label=None):
     """生成自包含的 DLC 模块源码（字符串）。
 
     chord: 可选，相对根音的半音偏移列表（如 [0, 4, 7]）；若给出则生成的音色
            为「同一音色叠加若干音调」的和弦音色（chord 字段 + 自求和 render）。
+    label: 可选，覆盖写入 DLC['label'] 的展示名。默认跟随 name。
+           撞名另存为 '<base>_N' 时传入唯一 key，使选择器展示可区分的标签，
+           避免出现多个同名「我的音色」导致用户误选原始版本（旧缓存设定的假象）。
     """
     safe = slugify(name)
+    label = label or name
     p = {k: params.get(k, PARAM_DEFAULTS[k]) for k in TYPE_PARAMS.get(type_name, [])}
     chord_src = ""
     if chord:
@@ -582,7 +594,7 @@ def build_dlc_source(name, type_name, params, chord=None):
         "import numpy as np\n"
         "from synth_factory import render as _sf_render\n\n"
         "DLC = {\n"
-        f"    'label': {name!r},\n"
+        f"    'label': {label!r},\n"
         "    'family': '我的DLC',\n"
         "    'needs_freq': True,\n"
         "    'kind': 'tonal',\n"
@@ -621,53 +633,21 @@ def resolve_dlc_save(name, *, editing_key=None, editing_name=None,
                      on_collide=None):
     """解析保存 DLC 时的目标文件名 key（不含 .py）。
 
-    规则：
-    - 回炉重造且名称与原 DLC 一致 → 返回原 key（覆盖同一文件）；
-    - 否则按名称 slug 作为新文件名：
-        · 不与内置 key 冲突（冲突则加 '_dlc'）；
-        · 若与库内既有 DLC key / 同名 .py 文件冲突 → 触发 on_collide：
-            True  = 覆盖原文件；False = 另存为 '<base>_2'（递归找唯一序号）。
-        · 无 on_collide（无 GUI 场景）时自动另存为带序号唯一 key。
-    返回 (key, action)，action ∈ {'edit','overwrite','new','rename'}。
+    主键规则（用户 DLC 一律用随机 32 位 UUID 作文件名主键，与展示名彻底解耦）：
+    - 新建 / 改名另存 → 返回全新 UUID key，action='new'（绝不撞名、绝不复用旧 key）；
+    - 回炉重造（editing_key 已设）→ 返回原 UUID key，action='edit'（覆盖同一文件，
+      无论名称是否改动，因为 uuid 才是唯一身份）。
 
-    此纯函数可从 headless 冒烟测试直接调用断言，避免把 GUI 逻辑写死在回调里。
+    dlc_keys / dlc_dir / builtin_keys / on_collide 保留为兼容形参（UUID 主键下不再
+    触发撞名逻辑），可从 headless 冒烟测试直接调用断言。
+    返回 (key, action)，action ∈ {'new','edit'}。
     """
     name = (name or '').strip() or '我的音色'
-    dlc_keys = set(dlc_keys or [])
-    builtin_keys = set(builtin_keys or [])
-
-    if editing_key is not None and name == editing_name:
-        # 真正回炉重造：覆盖原文件（文件名跟随原 key，不重命名）
+    if editing_key is not None:
+        # 回炉重造：保持同一 uuid 主键，覆盖原文件（uuid 即身份，与名称无关）
         return editing_key, 'edit'
-
-    # 新建 / 改名另存：文件名严格跟随名称 slug，绝不复用旧 key
-    base = slugify(name)
-    if base in builtin_keys:
-        base = base + '_dlc'
-    key = base
-
-    collide = (key in dlc_keys) or (
-        dlc_dir is not None and os.path.exists(os.path.join(dlc_dir, key + '.py')))
-    if not collide:
-        return key, 'new'
-
-    # 同名冲突：交由调用方决定覆盖还是另存
-    if on_collide is not None:
-        if on_collide(name, key):
-            return key, 'overwrite'
-        cand = '%s_2' % base
-        i = 2
-        while cand in dlc_keys or (dlc_dir and os.path.exists(os.path.join(dlc_dir, cand + '.py'))):
-            i += 1
-            cand = '%s_%d' % (base, i)
-        return cand, 'rename'
-    # 无 GUI：自动另存为唯一序号 key
-    cand = '%s_2' % base
-    i = 2
-    while cand in dlc_keys or (dlc_dir and os.path.exists(os.path.join(dlc_dir, cand + '.py'))):
-        i += 1
-        cand = '%s_%d' % (base, i)
-    return cand, 'rename'
+    # 新建：永远使用全新随机 UUID 作为文件名主键
+    return new_dlc_key(), 'new'
 
 
 def load_dlc_for_edit(key):

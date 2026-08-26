@@ -518,117 +518,100 @@ class RoundedSpinbox(tk.Canvas):
 
 
 def setup_custom_titlebar(root, app_ref=None, title='DouKunStudio'):
-    """隐藏原生标题栏，替换为抖音故障风自定义标题栏。
+    """已弃用：用户硬性要求一律使用 Tk 默认标题栏，不再自定义任何标题栏/控件。
 
-    标题栏左侧显示白色“DouKunStudio”文字 + 青色/洋红色偏移重影，
-    右侧提供最小化、最大化/还原、关闭按钮，并支持拖拽移动窗口。
-    该函数同时负责把窗口图标重新设置到 HWND，尽量修复任务栏图标空白。
+    保留此函数仅为兼容调用点，直接返回 None（不创建自定义窗口、不做任何 Win32
+    样式修改、不绑定拖动/最小最大化/关闭按钮）。以下原函数体已停用（不可达）。
     """
-    if sys.platform != 'win32':
-        return None
-    u = ctypes.windll.user32
+    return None
     # 声明 Win32 API 的参数/返回类型：64 位窗口句柄（HWND）若被 ctypes 默认按 32 位
     # c_int 处理，会被截断成「无效窗口」，导致 SetWindowLongW/LoadImageW 静默失败，
     # 任务栏按钮与图标都设置不上。必须显式声明 HWND/c_long 等类型。
     try:
         u.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
         u.GetWindowLongW.restype = ctypes.c_long
-        # 64 位下取/设窗口过程必须用 *PtrW，否则过程指针被截断成 32 位 → 窗口崩溃
-        u.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
-        u.GetWindowLongPtrW.restype = ctypes.c_void_p
         u.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
         u.SetWindowLongW.restype = ctypes.c_long
-        u.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
-        u.SetWindowLongPtrW.restype = ctypes.c_void_p
         u.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int,
                                    ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
         u.SetWindowPos.restype = wintypes.BOOL
         u.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
         u.SendMessageW.restype = wintypes.LPARAM
-        u.CallWindowProcW.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT,
-                                      wintypes.WPARAM, wintypes.LPARAM]
-        u.CallWindowProcW.restype = ctypes.c_longlong
         u.LoadImageW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR, wintypes.UINT,
                                  ctypes.c_int, ctypes.c_int, wintypes.UINT]
         u.LoadImageW.restype = wintypes.HANDLE
     except Exception:
         pass
 
-    # 关键：绝不能用 overrideredirect(True)。它会把窗口变成「无主 popup」，
-    # 既不进任务栏、也不进 Alt-Tab，切屏后就再也调不回来（用户已踩坑）。
-    # 正确做法：保留窗口为「受系统管理的普通重叠窗口」（自动拥有任务栏按钮与
-    # Alt-Tab 条目，可被切屏召回），仅通过样式去掉原生标题栏(WS_CAPTION)与
-    # 可拖拽边框(WS_THICKFRAME)，再自己画抖音故障风标题栏。
+    # 方案：保持窗口为系统管理的「普通重叠窗口」（自动拥有任务栏按钮 / Alt-Tab
+    # 条目 / 切屏可召回），仅从 GWL_STYLE 移除 WS_CAPTION（原生标题栏）与
+    # WS_SYSMENU（避免残留极小标题区），再 SetWindowPos(SWP_FRAMECHANGED) 强制
+    # 非客户区重算 —— **不子类化 WndProc、不碰 WM_NCCALCSIZE**，因此不会触发
+    # 此前批次 X 的 WM_NCCALCSIZE 同步死锁（已在探针中验证该写法不卡死）。
+    # 绝不能用 overrideredirect(True)：它会把窗口变成无主 popup，在用户机器上
+    # 任务栏 / Alt-Tab 彻底丢失（批次 W、Y 复现确认），切屏后无法召回。
+    #
+    # 关键坑（双眉头根因）：Tk 在 title()/geometry()/state(zoomed)/iconify() 等
+    # 操作后会**从缓存样式重建窗口框架**，把 WS_CAPTION 重新断言回来 → 原生
+    # 标题栏再次出现 = 「第二个眉头」。对策：把剥样式做成幂等函数 _strip_caption，
+    # 启动后 60/250/800ms 各重申一次，并绑定 <Configure>/<Map>（防抖 150ms）
+    # 重申——任何时点被 Tk 改回来都会立刻再剥掉。样式已正确时零开销（只读不改）。
+    GWL_STYLE = -16
+    GWL_EXSTYLE = -20
+    WS_CAPTION = 0x00C00000
+    WS_SYSMENU = 0x00080000
+    WS_THICKFRAME = 0x00040000
+    WS_MINIMIZEBOX = 0x00020000
+    WS_MAXIMIZEBOX = 0x00010000
+    WS_EX_APPWINDOW = 0x00040000
+    SWP_FRAMECHANGED = 0x0020
+    SWP_FLAGS = 0x0002 | 0x0001 | 0x0004 | 0x0010 | SWP_FRAMECHANGED  # NOMOVE|NOSIZE|NOZORDER|NOACTIVATE|FRAMECHANGED
+
+    def _strip_caption():
+        """幂等剥离原生标题栏：样式已正确则直接返回（无任何副作用）。"""
+        try:
+            hwnd = root.winfo_id()
+            if not hwnd:
+                return
+            style = u.GetWindowLongW(hwnd, GWL_STYLE)
+            want = ((style & ~(WS_CAPTION | WS_SYSMENU))
+                    | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME)
+            if want != style:
+                u.SetWindowLongW(hwnd, GWL_STYLE, want)
+                u.SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP_FLAGS)
+            ex = u.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            if not (ex & WS_EX_APPWINDOW):
+                u.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_APPWINDOW)
+        except Exception:
+            pass
+
     try:
         root.update_idletasks()
-        hwnd = root.winfo_id()
-        GWL_STYLE = -16
-        WS_CAPTION = 0x00C00000
-        WS_THICKFRAME = 0x00040000
-        style = u.GetWindowLongW(hwnd, GWL_STYLE)
-        style &= ~WS_CAPTION
-        style &= ~WS_THICKFRAME
-        u.SetWindowLongW(hwnd, GWL_STYLE, style)
-
-        GWL_EXSTYLE = -20
-        WS_EX_APPWINDOW = 0x00040000
-        ex = u.GetWindowLongW(hwnd, GWL_EXSTYLE)
-        u.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_APPWINDOW)
+        _strip_caption()
     except Exception:
         pass
 
-    # ---- 子类化 WndProc：处理 WM_NCCALCSIZE，让客户区覆盖整个窗口 ----
-    # 只去掉 WS_CAPTION 而不处理 WM_NCCALCSIZE，Windows 仍会保留一段原生
-    # 非客户区（标题栏区域）在自定义栏下方，形成「双层眉头」。把 rgrc[0]
-    # （客户区）对齐到 rgrc[1]（整个窗口），即可彻底消除这段残留区域。
+    # 主循环启动、窗口完成映射后再重申（覆盖 title()/geometry()/map 造成的样式重建）
+    for _ms in (60, 250, 800):
+        try:
+            root.after(_ms, _strip_caption)
+        except Exception:
+            pass
+
+    # 窗口状态变化（最大化/还原/最小化/尺寸变化）后 Tk 会重建框架 → 防抖重申
+    _reassert_after = {'id': None}
+
+    def _schedule_reassert():
+        if _reassert_after['id'] is not None:
+            try:
+                root.after_cancel(_reassert_after['id'])
+            except Exception:
+                pass
+        _reassert_after['id'] = root.after(150, _strip_caption)
+
     try:
-        hwnd = root.winfo_id()
-        GWL_WNDPROC = -4
-        WM_NCCALCSIZE = 0x0083
-
-        class _RECT(ctypes.Structure):
-            _fields_ = [('left', ctypes.c_long), ('top', ctypes.c_long),
-                        ('right', ctypes.c_long), ('bottom', ctypes.c_long)]
-
-        class _NCCALCSIZE_PARAMS(ctypes.Structure):
-            _fields_ = [('rgrc', _RECT * 3), ('lppos', ctypes.c_void_p)]
-
-        old_proc = u.GetWindowLongPtrW(hwnd, GWL_WNDPROC)
-
-        WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_longlong, wintypes.HWND,
-                                     wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
-
-        def _wnd_proc(h, msg, wp, lp):
-            if msg == WM_NCCALCSIZE and wp:
-                try:
-                    params = ctypes.cast(lp, ctypes.POINTER(_NCCALCSIZE_PARAMS)).contents
-                    # 客户区 = 整个窗口（去掉顶部原生标题栏预留区）
-                    params.rgrc[0].left = params.rgrc[1].left
-                    params.rgrc[0].top = params.rgrc[1].top
-                    params.rgrc[0].right = params.rgrc[1].right
-                    params.rgrc[0].bottom = params.rgrc[1].bottom
-                except Exception:
-                    pass
-                return 0
-            return u.CallWindowProcW(old_proc, h, msg, wp, lp)
-
-        new_proc = WNDPROC(_wnd_proc)
-        u.SetWindowLongPtrW(hwnd, GWL_WNDPROC, new_proc)
-        # 保持引用，避免回调被 GC 后 Windows 调用悬空 thunk 崩溃
-        root._dk_wndproc = new_proc
-        root._dk_oldproc = old_proc
-    except Exception:
-        pass
-
-    # ---- 重新应用尺寸变更，使 WM_NCCALCSIZE 立即生效 ----
-    try:
-        hwnd = root.winfo_id()
-        SWP_NOMOVE = 0x0002
-        SWP_NOSIZE = 0x0001
-        SWP_NOZORDER = 0x0004
-        SWP_FRAMECHANGED = 0x0020
-        u.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
-                       SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED)
+        root.bind('<Configure>', lambda e: _schedule_reassert(), add='+')
+        root.bind('<Map>', lambda e: _schedule_reassert(), add='+')
     except Exception:
         pass
 
