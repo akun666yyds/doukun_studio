@@ -1,0 +1,38 @@
+# ===== Python 缓存 =====
+__pycache__/
+*.py[cod]
+*.pyo
+*$py.class
+
+# ===== 构建产物（单文件 exe 不入库） =====
+dist/
+build/
+*.spec~
+
+# ===== 采样数据与离线 wheel（非源码） =====
+samples/
+samples_incoming/
+wheels/
+
+# ===== 测试/构建临时残留 =====
+%TMPD%/
+instrument_dlc/__pycache__/
+instrument_dlc/_smoke_types/
+*.wav
+
+# ===== 虚拟环境 =====
+.venv/
+venv/
+env/
+
+# ===== 工作区记忆（含本地笔记，不入库） =====
+.workbuddy/
+
+# ===== 设计稿候选（仅 icon.ico / icon_1024.png 入庍，其余 AI 生成 logo 候选忽略） =====
+assets/*.png
+!assets/icon_1024.png
+
+# ===== 编辑器 =====
+.vscode/
+*.swp
+.DS_Store
