@@ -198,6 +198,7 @@ class PianoRoll(tk.Canvas):
         """
         self.project = project
         self.track = None
+        self._grid_drawn = False   # 工程切换：静态网格几何可能变化，强制下次完整重绘
         self.selected_note = None
         self.selected_notes = set()
         self.drag = None
@@ -232,6 +233,7 @@ class PianoRoll(tk.Canvas):
                              font=('Microsoft YaHei', 12), tags=('grid',))
             self.configure(scrollregion=(0, 0, 1, 1))
             self._content_w = self._content_h = 0
+            self._grid_drawn = False   # 静态网格未绘制：下次 redraw 必须完整重绘
             return
         w = self.grid_width() + 60
         h = self.grid_height() + RULER_H + 40

@@ -1016,6 +1016,13 @@ class App:
         tk.Label(left, textvariable=uuid_var, font=(FONT_FAMILY, 10), fg=TEXT_MUTED, bg=BLACK).pack(anchor='w')
         editing_key = {'key': None, 'orig_name': None}   # 当前是否处于「编辑已有 DLC」模式
 
+        def _dlc_in_use(key):
+            """当前工程是否有任何音轨正在使用该 DLC 音色（按 uuid key 判断）。"""
+            try:
+                return any(t.instrument == key for t in self.project.tracks)
+            except Exception:
+                return False
+
         def _load_dlc_info(e=None):
             idx = load_cb.current()
             if idx <= 0:
@@ -1060,7 +1067,10 @@ class App:
                     matched = pname
                     break
             preset_cb.set(matched)
-            status.set('已加载：%s（%s）' % (info['name'], synth_factory.TYPE_LABELS.get(t, t)))
+            if _dlc_in_use(key):
+                status.set('⚠ 该音色正在被音轨使用：可查看/编辑，但「合成并保存」将被禁止。\n请先在音轨改用其他音色，再回炉此 DLC。')
+            else:
+                status.set('已加载：%s（%s）' % (info['name'], synth_factory.TYPE_LABELS.get(t, t)))
 
         load_cb.bind('<<ComboboxSelected>>', _load_dlc_info)
 
@@ -1127,6 +1137,13 @@ class App:
             if not name:
                 status.set('请先填写 DLC 名称')
                 return
+            # 禁止正在被音轨使用的 DLC 回炉重造：避免「改了却听不到变化」（已预热
+            # 的预览缓存 / 正在播放的音轨仍持旧音色），也防止改变正在播放的音轨音色。
+            # 请先在音轨改用其他音色，再回炉此 DLC。
+            ek = editing_key.get('key')
+            if ek and _dlc_in_use(ek):
+                status.set('⚠ 该音色正在被音轨使用，禁止回炉重造。\n请先在音轨改用其他音色，再回炉此 DLC。')
+                return
             t = _type_key()
             params = current_params()
             offs = sorted(chord_state['offsets']) or [0]
@@ -1156,6 +1173,7 @@ class App:
                 label=(key if action == 'rename' else None))
             path = synth_factory.write_dlc(key, src)
             synth.load_dlc_folder()   # 注册进内核（即插即用）
+            ae.clear_preview_cache(key)  # 失效该 DLC 试听/预览缓存，确保回炉后立即生效
             ae.preview_stop()
             # 保存后保持「继续编辑本 DLC」态，便于微调覆盖同一文件
             editing_key['key'] = key
